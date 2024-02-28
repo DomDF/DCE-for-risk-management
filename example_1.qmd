@@ -1,0 +1,624 @@
+---
+title: "Data-Centric Engineering"
+subtitle: "Example 1: Analysis of Material Test Data"
+format:
+  html:
+    knitr: true
+    theme: 
+      - simplex
+      - custom.scss
+    highlight-style: atom-one
+    html-math-mathod: mathjax
+    toc: true
+    code-copy: true
+    code-fold: true
+    code-tools: true
+    code-overflow: scroll
+    monofont: Fira Code
+    self-contained: true
+    self-contained-math: true
+    mermaid:
+      theme: forest
+execute:
+  message: false
+  warning: false
+
+---
+
+## Introduction
+
+This is an example of a data-centric engineering workflow. The goal is to quantify the uncertainty (variability) in a set of tensile test results, and consider how this could be used to support a decision.
+
+## Libraries
+
+```{r}
+#| echo: false
+
+library(tidyverse)
+JuliaCall::julia_setup(JULIA_HOME = "/Users/ddifrancesco/.juliaup/bin/")
+```
+
+```{julia}
+#| output: false
+# for reading and processing data
+using CSV, DataFrames, DataFramesMeta, RCall
+
+# for probabilistic analysis of the data
+using Random, Distributions, Bootstrap, Turing
+
+# for reproducibility when using random number generators
+seed_value = 231123
+```
+
+## Test data
+
+This example considers how to interpret a set of measurements of material yield strength, accounting for statistical uncertainty. The data is presented in @tbl-strength_data.
+
+```{julia}
+#| output: false
+
+strength_data = CSV.read("data_files/yield_data.csv", DataFrame)
+```
+
+```{julia}
+#| echo: false
+#| output: false
+
+@rput(strength_data)
+```
+
+```{r}
+#| echo: false
+#| label: tbl-strength_data
+#| tbl-cap: "Tensile Test Data of Steel"
+
+strength_data |> 
+  rename('Test ID' = 'id', 'Yield Strength, MPa' = 'yield_MPa') |> 
+  knitr::kable()
+
+```
+
+The results indicate some variability even though each row presents the result of the same test, using the same machine, on a tensile specimen from the same material. This variability can be attributed to:
+
+ - **Material heterogeneity**. Manufacturing processes used to make structural steel results in local hard spots, laminations, inclusions and other anomalies that can locally influence the strength of the material. The presence of such anomalies in the microstructure of a testing specimen will influence the measured properties.
+
+ - **Imperfect measurement data**. There is no manufacturing process that creates perfectly homogeneous steel, and there is no measurement of an engineering quantity that will tell us everything we want to know. In this example, the machine used to perform the tests will output results with some precision, which has been quantified by the manufacturers.
+
+## Variability
+
+### Initial thoughts
+
+The lowest value is `r min(strength_data$yield_MPa)`MPa, and the highest value is `r max(strength_data$yield_MPa)`MPa. There is therefore a range of `r range(strength_data$yield_MPa) |> diff()`MPa. There are many ways that this can be interpreted. 
+
+Since no value was recorded less than 342 MPa, can it be assumed that lower yield strengths are not credible? 
+
+Or should you assume that the true yield strength is not known, and that the data is only a sample of the possible values?
+
+:::{.callout-note collapse="true"}
+## Dealing with variability
+
+Engineers need to incorporate uncertainty in quantities like material properties to ensure safety and efficiency. Using a *worst-case* or *conservative* value as as a threshold is convenient as it does not complicate the calculation, but it doesn't fully solve the problem because there may not be an obvious threshold value to take. Using the lowest yield strength value measured so far may incentivise minimal testing, as the value will only decrease (or remain constant) as more data is collected.
+
+One attempt to get around this, is provided in the guidance on identifying a suitable value of fracture toughness in a widely used structural integrity management standard [@BSI2015]. It introduces the procedure for a Minimum Of Three Equivalent (MOTE), estimate. When $3 \to 5$ measurements are available, engineers are advised to take the lowest value, then the second lowest value of $6 \to 10$ measurements, and the third lowest of $10 \to 15$ values.
+
+By running some simulations of fracture toughness tests, below, it can be shown that even by using the MOTE value, there is generally more uncertainty with fewer tests. This results in relatively higher probabilities of non-conservative values such as those greater than the mean (indicated by the dashed line in @fig-MOTE) being selected.
+
+```{julia}
+#| output: false
+
+function MOTE(samples::Vector{Float64})
+    n = length(samples)
+    if n < 3 || n > 15
+        print("Between 3 and 15 samples required")
+    else 
+        MOTE = sort(samples)[n/5 |> ceil |> Int]
+    end
+    return MOTE
+end
+
+K_mat = Normal(80, 25) |> dist -> truncated(dist, lower = 0)
+
+MOTE_df = DataFrame()
+for i ∈ 1:100
+    meas_strength = rand(MersenneTwister(i), K_mat, 15)
+    for j ∈ 3:length(meas_strength)
+        append!(MOTE_df, 
+                DataFrame(sim = i, 
+                          n_tests = j, 
+                          MOTE = MOTE(meas_strength[begin:j])))
+    end
+end
+```
+
+
+```{julia}
+#| echo: false
+#| output: false
+
+K_mat = Dict("μ" => mean(K_mat), "σ" => std(K_mat))
+
+@rput(MOTE_df); @rput(K_mat)
+```
+
+```{r}
+#| echo: false
+#| label: fig-MOTE
+#| fig-cap: "Effect of number of tests on BS 7910 MOTE estimate of fracture toughness"
+
+y_min <- 0; y_max <- 150; 
+
+MOTE_plot <- ggplot(data = MOTE_df)+
+  geom_point(mapping = aes(x = n_tests, y = MOTE), alpha = 1/8)+
+  geom_hline(mapping = aes(yintercept = K_mat$μ), alpha = 1/2, lty = 2)+
+  scale_x_continuous(name = "Number of Toughness Measurements", 
+                     breaks = seq(from = min(MOTE_df$n_tests), to = max(MOTE_df$n_tests), by = 1))+
+  scale_y_continuous(name = expression(paste("MOTE, N·",~mm^{-3/2})), limits = c(y_min, y_max))+
+  ggthemes::theme_base(base_family = "Atkinson Hyperlegible", base_size = 11)+
+  theme(legend.title = element_blank(), plot.background = element_rect(colour = NA))
+
+dist_plot <- ggplot(data = NULL)+
+  geom_function(fun = dnorm, args = list(mean = K_mat$μ, sd = K_mat$σ))+
+  geom_vline(mapping = aes(xintercept = K_mat$μ), alpha = 1/2, lty = 2)+
+  xlim(y_min, y_max)+
+  coord_flip()+
+  theme_void()
+
+library(patchwork)
+(MOTE_plot + dist_plot) + plot_layout(widths = c(4, 1))
+
+```
+
+:::
+
+### Using probability
+
+This variability can be approximated using probability distributions. Below, shows how a Normal distribution can be used to approximate the uncertainty in material strength, based on the data in @tbl-strength_data. 
+
+```{julia}
+#| echo: true
+
+fit_mle(Normal, strength_data.yield_MPa)
+```
+
+The estimates for the distribution parameters (mean, and standard deviation) represent those with the highest score (likelihood) of the range considered. If the standard deviation was any higher, the likelihood of any values near the mean would be reduced, and if it was any lower the likelihood of any data at the tails would be reduced. Similarly, if the mean was any higher, the likelihood of any lower values would be reduced. So there is a trade-off here, and these *maximum likelihood estimates* will provide the values that maximise the product of the likelihoods (or the sum of the log-likelihoods) for the data that is being used to fit the distribution.
+
+However, there may often not be a clear maximum likelihood, particularly when estimating distribution parameters from a small dataset. In these cases the statistical uncertainty results in many possible values being credible (or having a similar likelihood). Failing to account for this uncertainty can lead to overconfidence in the results, poor predictions, and misinformed decisions.
+
+One method of quantifying this variability is to find confidence intervals. These can be obtained by repeating the calculation many times using different samples of the data. The confidence interval is the range within which, in repeated experiments, the true value will be contained a specified proportion (in this case 95%) of the time.
+
+```{julia}
+#| output: false
+
+function get_MLE_params(data, distr = Normal)
+    params = Distributions.fit_mle(distr, data)
+    return (params.μ, params.σ)
+end
+
+```
+
+```{julia}
+#| echo: true
+
+param_conf_ints = bootstrap(get_MLE_params, strength_data.yield_MPa, BasicSampling(1_000)) |>
+    bootstrap -> confint(bootstrap, BasicConfInt(0.95)) |>
+    conf_ints -> Dict("μ" => conf_ints[1], "σ" => conf_ints[2])
+```
+
+How a confidence interval can be used to support decision making is not clear, so we will consider a full (Bayesian) probabilistic model of yield strength, with more interpretable characterisation of uncertainty.
+
+:::{.callout-note collapse="true"}
+## Collecting data to reduce uncertainty
+The reason engineers pay for material tests, inspection activities and sensing systems is because the data that they provide can be used to estimate some uncertain quantity of interest. In general, the more data that is available, the less uncertainty will be associated with the prediction.
+
+For instance, a linear model with a straight line that approximately goes through two or three points is much less compelling than a straight line that approximately goes through hundreds of points (when the errors are the same).
+
+The uncertainty that is associated with limited amounts of data is often referred to as statistical or epistemic uncertainty. This document includes a calculation that quantifies the expected value of performing more material testing. This value arises from the expected reduction in statistical uncertainty from the additional data, and what this better understaning of the material properties mean for our decisions.
+:::
+
+A probabilistic model for yield strength is proposed in @eq-priors_1. The mean, $\mu_{\textrm{yield}}$ and standard deviation, $\mu_{\textrm{yield}}$ are the parameters that we would like to infer, using the data. However, we can also use any additional information we may have, which could be evidence from other datasets, or estimates from an expert. This is achieved by providing a starting point (or *prior*) for the model parameters. Providing a sensible starting point can help models converge to useful ouputs more quickly, and can also prevent overfitting (since they are no longer entirely dependent on the dataset). 
+
+Suggested starting points for $\mu_{\textrm{yield}}$ and $\sigma_{\textrm{yield}}$ are shown in @eq-priors_2 and @eq-priors_3, respectively. It can be challenging to read these equations, so it is generally recommended [@Gelman2020a] to plot the predited outputs associated with these priors. This is shown in @fig-prior_pred, which indicates a range of possible yield strengths are considered credible, but we would need relatively more evidence to believe measurements below $100$ MPa or above $600$ MPa. If these predictions do not appear reasonable to an expert, then the priors can be adjusted.
+
+$$
+\textrm{yield} \sim \mathcal{N}(\mu_{\textrm{yield}}, \sigma_{\textrm{yield}})
+$$ {#eq-priors_1}
+
+$$
+\mu_{\textrm{yield}} \sim \mathcal{N}(\mu = 300, \sigma = 100)
+$$ {#eq-priors_2}
+
+$$
+\sigma_{\textrm{yield}} \sim exponential(\lambda = 50)
+$$ {#eq-priors_3}
+
+```{julia}
+#| output: false
+
+prior_pred_samples = function(;μ, σ, n_samples = 100, seed_value = 231123)
+    prior_pred_df = DataFrame(
+        mean_yield = rand(MersenneTwister(seed_value), μ, n_samples),
+        sd_yield = rand(MersenneTwister(seed_value), σ, n_samples)
+        ) |>
+            df -> @rtransform(df, :yield_model = Normal(:mean_yield, :sd_yield) |> 
+                                                 dist -> truncated(dist, lower = 0, upper = 1_000)) |>
+            df -> @rtransform(df, :yield_strength = rand(MersenneTwister(seed_value), :yield_model, 1)[1])
+
+    return prior_pred_df
+end
+```
+
+```{julia}
+#| output: false
+#| echo: false
+
+prior_pred_samples = prior_pred_samples(μ = Normal(300, 100), σ = Exponential(10)).yield_strength
+
+@rput(prior_pred_samples)
+```
+
+```{r}
+#| echo: false
+#| label: fig-prior_pred
+#| fig-cap: "Predictive samples of yield strength from prior models"
+
+ggplot(data = tibble(samples = prior_pred_samples)) +
+    geom_histogram(mapping = aes(x = samples, y = after_stat(density), fill = "prior predictive samples"), bins = 10, alpha = 1/2)+ 
+    scale_fill_manual(values = c("firebrick"))+
+    scale_x_continuous(name = "Yield strength, MPa", 
+                     breaks = scales::pretty_breaks())+
+  scale_y_continuous(name = "Probability density")+
+  ggthemes::theme_base(base_family = "Atkinson Hyperlegible", base_size = 11)+
+  theme(legend.title = element_blank(), legend.position = "top",
+        plot.background = element_rect(colour = NA))
+```
+
+Below, the model is described in the `Turing` probabilistic programming language, [link](https://turing.ml). The output from this model is samples from the joint distribution of the parameters, $\mu_{\textrm{yield}}$ and $\sigma_{\textrm{yield}}$. 
+
+```{julia}
+#| output: false
+
+@model function yield_model(yield_strength_meas::Vector{Float64}, ϵ::Float64 = 5.0)
+    
+    # Priors
+    μ ~ Normal(300, 100)
+    σ ~ Exponential(50)
+    
+    # Number of samples
+    n_samples = length(yield_strength_meas)
+
+    # Gaussian model for each true yield strength
+    yield_strength = Vector{Float64}(undef, n_samples)
+    for i ∈ 1:n_samples
+        yield_strength[i] ~ Normal(μ, σ)
+    end
+
+    # Relating true yield strength to the imprecise test data
+    for n ∈ 1:n_samples
+        yield_strength_meas[n] ~ Normal(yield_strength[n], ϵ)
+    end
+
+end
+```
+
+
+```{julia}
+#| output: false
+
+n_mcmc = 10_000; n_chains = 4; n_draws = n_mcmc/n_chains |> Int; n_warmup = 5_000
+sampler = NUTS(n_warmup, 0.65)
+
+posterior_df = yield_model(strength_data.yield_MPa) |>
+    model -> sample(MersenneTwister(seed_value), model, sampler, MCMCThreads(), n_draws, n_chains) |> DataFrame |>
+    df -> @select(df, :chain, :iteration, :σ, :μ) |>
+    df -> @rtransform(df, :yield_model = Normal(:μ, :σ)) |>
+    df -> @rtransform(df, :yield_strength = rand(MersenneTwister(seed_value), :yield_model, 1)[1])
+
+```
+
+```{julia}
+#| echo: false
+#| output: false
+
+@rput(posterior_df)
+```
+
+We can use these samples to make new predictions of yield strength, which in @fig-post_pred are compared to the prior predictions. The posterior predictions have less variance as they have incorporated the information from the data.  
+
+```{r}
+#| echo: false
+#| label: fig-post_pred
+#| fig-cap: "Predictive samples of yield strength from posterior distribution"
+
+ggplot(data = NULL) +
+    geom_histogram(data = tibble(samples = prior_pred_samples), mapping = aes(x = samples, y = after_stat(density), fill = "prior predictive samples"), bins = 10, alpha = 1/2)+ 
+    geom_histogram(data = posterior_df, mapping = aes(x = yield_strength, y = after_stat(density), fill = "posterior predictive samples"), bins = 20, alpha = 1/2)+
+    scale_fill_manual(values = c("forestgreen", "firebrick"))+
+    scale_x_continuous(name = "Yield strength, MPa", 
+                     breaks = scales::pretty_breaks())+
+  scale_y_continuous(name = "Probability density")+
+  ggthemes::theme_base(base_family = "Atkinson Hyperlegible", base_size = 11)+
+  theme(legend.title = element_blank(), legend.position = "top",
+        plot.background = element_rect(colour = NA))
+```
+
+:::{.callout-note collapse="true"}
+## A joint distribution of parameters
+
+These samples from the joint *posterior* distribution are shown in @fig-MCMC_post_sigmaY. Note that all of the relatively low values of standard deviation (coloured in green) correspond to a narrow range of possible mean values, wheras the relatively high values (coloured in purple) were sometimes associated with much higher or lower values for the mean. 
+
+One way to rationalise this is that, whilst there is some uncertainty in the estimate of the mean value of yield strength, for low or high values to be consistent with the available data, they may need to be associated with a greater variance. A low standard deviation that was associated with a very low mean value would correspond to a narrow distribution that did not greatly overlap with the test data, which is why we do not see this combination in @fig-MCMC_post_sigmaY.
+
+Being able to push these uncertainties and dependencies into predictions, is why probabilistic models can provide useful, informative results, even with small amounts of imperfect data.
+
+```{r}
+#| echo: false
+#| label: fig-MCMC_post_sigmaY
+#| fig-cap: "Samples from Joint Distribution of Parameters in Probabilistic Yield Strength Model"
+
+posterior_df |>
+  mutate(ind = case_when(
+    σ <= 20 ~ "Low",
+    σ >= 35 ~ "High",
+    T ~ "Med"
+  )) |>
+  ggplot()+
+  geom_point(mapping = aes(x = μ, y = σ, fill = ind), shape = 21, alpha = 1/2)+
+  scale_fill_viridis_d()+
+  scale_x_continuous(name = "Mean Yield Strength, MPa")+
+  scale_y_continuous(name = "Standard Deviation of Yield Strength, MPa")+
+  ggthemes::theme_base(base_family = "Atkinson Hyperlegible", base_size = 11)+
+  theme(legend.title = element_blank(), legend.position = "none",
+        plot.background = element_rect(colour = NA))
+```
+
+:::
+
+## Decision making
+
+So is this reduction in uncertainty enough? Is it fair to say that we know sufficiently understand the yield strength of the material? This will naturally depend on why we are asking the question. 
+
+Intuitively, in cases where it is already clear how to act and all stakeholders are in agreement on which (if any) risk mitigation to proceed with, then the remaining uncertainty is not an issue. For instance, the strength of a redundant component, that will not cost much to replace, and is not in a high consequence application may not need to be quantified precisely. Similarly, a rare upcoming window to affordably replace a veru high consequence component may not need to be delayed so that more analysis can be completed.
+
+However, in instances where not all stakeholders agree on a course of action, it may be worthwhile asking the question:
+
+*How* and *to what extent* will collecting more data facilitate improved decision making?
+
+This is quantified using *Value of Information* (VoI) analysis, where the probabilistic model is jointly represented with the underlying decision problem, and simulations are run to describe what we expect to measure, and then consider what that implies for our decisions. 
+
+An example decision problem is shown grpahically in @fig-yield_id. The uncertainty in the yield strength impacts our estimate of the reliability with which it can meet it's design requirements. We have the option to do some last minute changes to the design to mitigate this risk, and we can also do some more testing to reduce the uncertainty.
+
+```{mermaid}
+%%| label: fig-yield_id
+%%| fig-cap: "Decision problem associated with yield strength meeting specification"
+
+flowchart LR
+  o1((material \nstrength)) --> o2((component \nreliability))
+  o3((strength \n requirements)) --> o2
+  d1[re-design \noptions] --> o2
+  d1 --> c1{cost of \nre-design}
+  o2 --> c2{cost of not \n meeting \n specification}
+
+  d2[complete further \n material testing] --> o1
+  d2 --> c3{cost of \n additional testing}
+
+```
+
+This inputs are summarised in @tbl-decision_inputs. The most cautious would be to both (a) increase the resistance of the component by purchasing more material and increasing a key dimension, and (b) change the intended operation of the component, so that it is has more lenient requirements. 
+
+```{r}
+#| echo: false
+#| label: tbl-decision_inputs
+#| tbl-cap: "Constraints on redesign decision problem"
+
+tribble(
+  ~Parameter, ~Type, ~value, ~units,
+  "cost of increasing dimension", "cost", 3000, "GBP, £",
+  "cost of changing intended operation", "cost", 5000, "GBP, £",
+  "cost of failing to meet specification", "cost", 1000000, "GBP, £",
+  "effect of increasing dimension", "multiplicative factor", 1.1, "-",
+  "effect of changing intended operation", "multiplicative factor", 1.25, "-",
+  "specification threshold strength", "requirement", 300, "MPa"
+) |> knitr::kable()
+
+```
+
+This inputs are descirbed below, along with a function to evaluate the expected outcomes associated with each possible action. 
+
+```{julia}
+#| output: false
+
+redesign_costs = Dict(
+    "no_action" => 0.0,
+    "increase_resistance" => 3_000.0, 
+    "change_operation" => 5_000.0
+    )
+
+σY_threshold = 300.0; cost_below_threshold = 1_000_000
+
+redesign_factors = Dict(
+    "no_action" => 1.0, 
+    "increase_resistance" => 1.1, 
+    "change_operation" => 1.25
+    )
+
+
+function find_expected_costs(σY::Vector{Float64}, threshold::Float64, costs::Dict{String, Float64})
+    
+    pr_below = sum(σY .< threshold) / length(σY)
+    pr_below_incr_res = sum(σY * redesign_factors["increase_resistance"] .< threshold) / length(σY)
+    pr_below_ch_op = sum(σY * redesign_factors["change_operation"] .< threshold) / length(σY)
+
+    return(
+        DataFrame(
+            action = ["no_action", "change_operation", "increase_resistance"],
+            expected_cost = [costs["no_action"] + pr_below * cost_below_threshold,
+                             costs["change_operation"] + pr_below_ch_op * cost_below_threshold,
+                             costs["increase_resistance"] + pr_below_incr_res * cost_below_threshold]
+        )
+    )
+
+end
+```
+
+As shown below, the expected optimal action is to increase the resistance of the component, as this is expected to result in the lowest cost. 
+
+```{julia}
+find_expected_costs(posterior_df.yield_strength, σY_threshold, redesign_costs)
+
+```
+
+We can then use samples from the probabilistic model of yield strength, as hypothetical measurements that could be obtained if more testing was completed. For each of these prospective outcomes, the decision problem is solved again, and averaging over these simulations gives an expected cost in the presence of this data. The difference between the expected cost with and without the data is the expected value (i.e. how much we should be willing to pay) for the information.
+
+```{julia}
+#| eval: false
+
+VoPI_df = DataFrame()
+for σY_meas ∈ sort(posterior_df.yield_strength, rev = false)
+
+    meas_df = find_expected_costs([σY_meas], σY_threshold, redesign_costs) |>
+        df -> sort(df, :expected_cost, rev = false) |>
+        df -> first(df, 1)
+
+    append!(VoPI_df, 
+            DataFrame(σY = σY_meas,
+                      exp_action = meas_df.action[1],
+                      expected_cost = meas_df.expected_cost[1]))
+end
+
+VoPI = prior_decision.expected_cost[1] - (VoPI_df.expected_cost |> mean)
+
+```
+
+The outcome from each simulation is shown in @fig-VoPI, where the dashed vertical line indicates the prior expected cost, and the solid vertical line indicates the expected cost with additional testing. The difference between the two is labelled `EVoPI` and is the expected value of *perfect* information. This is because it assumes that further testing will completely resolve the uncertainty in the yield strength. This estimate represents a convenient upper bound, but we can introduce more realistic assumptions by considering the precision with which the yield strength is estimated from tensile testing.  
+
+```{r}
+#| echo: false
+#| label: fig-VoPI
+#| fig-cap: "Simulating hypothetical measurements of yield strength to quantify the expected value of completing further testing"
+
+prior_df <- readr::read_csv(file = "data_files/prior_decision.csv")
+
+VoPI_df <- readr::read_csv(file = "data_files/VoPI_df.csv")
+VoI_df <- readr::read_csv(file = "~/Github/DCE_training/Example_1/data_files/VoI_new_df.csv")
+
+arrow_df <- tibble(x = (prior_df |> filter(expected_cost == min(prior_df$expected_cost)))$expected_cost,
+                   xend = VoPI_df$expected_cost |> mean(),
+                   y = 3, yend = 3)
+
+VoPI_df$exp_action <- gsub(x = VoPI_df$exp_action, pattern = "_", replacement = "\n")
+
+ggplot(data = VoPI_df |>
+         mutate(exp_action = factor(x = exp_action, levels = c("no\naction", "increase\nresistance", "change\noperation"))),
+       mapping = aes(x = expected_cost, y = exp_action))+
+  geom_jitter(shape = 21, alpha = 2/3, width = 1500, mapping = aes(fill = σY))+
+  geom_vline(mapping = aes(xintercept = (prior_df |> filter(expected_cost == min(prior_df$expected_cost)))$expected_cost, 
+                           lty = "Expected cost without further testing"), alpha = 1/2) +
+  geom_vline(mapping = aes(xintercept = VoPI_df$expected_cost |> mean(), 
+                           lty = "Expected cost with additional testing"), alpha = 1/2)+
+  geom_segment(data = arrow_df,
+               mapping = aes(xend = x, x = xend, y = y, yend = yend, col = "EVoPI"), 
+               arrow = arrow(length = unit(0.25, "cm"), ends = "first", type = "closed"))+
+  scale_color_manual(values = c("midnightblue"))+
+  geom_text(data = arrow_df,
+            mapping = aes(x = mean(x, xend), y = 3, 
+                          label =  paste0("£", (x - xend) |> signif(digits = 3))),
+            family = "Atkinson Hyperlegible", size = 3.5, vjust = -2, hjust = 6)+
+  scale_fill_viridis_c()+
+  labs(y = "Expected Optimal Action", fill = "Measured yield strength, MPa", lty = "", col = "")+
+  scale_x_continuous(name = "Expected Cost, £", breaks = scales::pretty_breaks(), limits = c(0, 5000), oob = scales::squish)+
+  ggthemes::theme_base(base_size = 12, base_family = "Atkinson Hyperlegible")+
+  theme(legend.position = 'top', legend.title = element_text(size = 8), legend.text = element_text(size = 8),
+        axis.text.y = element_text(angle = 90, hjust = 0.5), 
+        plot.background = element_rect(colour = NA))+
+  guides(linetype = guide_legend(nrow = 2), 
+         fill = guide_colorbar(title.position = 'top', barwidth = 8, barheight = 3/4, order = 3))
+
+n_tests <- 6
+
+```
+
+In @fig-VoI, the expected value of collecting another set of `r n_tests`, with varying precision, is shown. Interestingly, this analysis shows that it would not be worth paying more for a more precise test. For further testing to be considered worthwhile, in the context of supporting this risk management decision problem, a vendor would need to be able to offer it at a price less than the expected value it is expected to provide. If this was not available, this analysis could serve as a demonstration that, at the time the decision was required, paying for more testing was shown to not be a risk-optimal allocation of resources.
+
+```{julia}
+#| output: false
+#| eval: false
+
+VoI_new_df = DataFrame(); new_meas_sd = 1.0
+
+n_tests = 6
+max_iter = (length(posterior_df.yield_strength) / n_tests) - 1 |> 
+    iter -> floor(iter) * n_tests |> Int
+
+for new_meas_sd ∈ [1.0, 5.0, 10.0, 20.0, 30.0]
+
+    for test ∈ 1:n_tests:max_iter
+        σY_meas = posterior_df.yield_strength[test:test + n_tests - 1]
+
+        meas_df = vcat(yield_data.yield_MPa, σY_meas) |>
+            data -> yield_model(data, ϵ = vcat(repeat([5.0], n_tests), repeat([new_meas_sd], n_tests))) |>
+            model -> sample(MersenneTwister(seed_value), model, sampler, MCMCThreads(), n_draws, n_chains) |> DataFrame |>
+            df -> @select(df, :chain, :iteration, :σ, :μ) |>
+            df -> @rtransform(df, :yield_model = Normal(:μ, :σ) |> dist -> truncated(dist, lower = 0)) |>
+            df -> @rtransform(df, :yield_strength = rand(MersenneTwister(seed_value), :yield_model, 1)[1]) |>
+            df -> find_expected_cost(df.yield_strength, σY_threshold, redesign_costs) |>
+            df -> sort(df, :expected_cost, rev = false) |>
+            df -> first(df, 1)
+
+        append!(VoI_new_df, 
+                DataFrame(σY = [σY_meas],
+                        new_meas_sd = new_meas_sd,
+                        exp_action = meas_df.action[1],
+                        expected_cost = meas_df.expected_cost[1]))
+
+        # print progress as a perdentage complete for each new_meas_sd
+        if test/max_iter * 100 % 1 == 0
+            print("$(round((test / max_iter) * 100, digits = 2))% complete for new_meas_sd = $new_meas_sd\n")
+        end
+    end
+
+end
+```
+
+```{r}
+#| echo: false
+#| label: fig-VoI
+#| fig-cap: "Quantification of the expected value of an additional set of yield strength measurements, of varying precision"
+
+n_sim <- 1666
+VoPI <- prior_df$expected_cost - (VoPI_df$expected_cost |> mean())
+
+ggplot(data = VoI_df |>
+           group_by(new_meas_sd) |>
+           mutate(eC = mean(expected_cost)) |>
+           mutate(mcse = sd(expected_cost) / sqrt(n_sim)) |>
+           ungroup() |>
+           distinct(new_meas_sd, .keep_all = T) |>
+           select(c(new_meas_sd, eC, mcse)) |>
+           mutate(VoI = prior_df$expected_cost - eC) |>
+           mutate(precision = c("more \nprecise \ntesting", "equally \nprecise \ntesting", 
+                                "less \nprecise \ntesting", "even less \nprecise", "least \nprecise")))+
+  geom_pointrange(mapping = aes(x = new_meas_sd, y = VoI, ymin = VoI - mcse, ymax = VoI + mcse,
+                                shape = "Expected value of completing further testiing ± MCSE"), 
+                  alpha = 1/2, col = "forestgreen")+
+  ggrepel::geom_text_repel(mapping = aes(x = new_meas_sd, y = VoI, 
+                          label = paste0(precision, ": £", VoI |> signif(digits = 3))), 
+            family = "Atkinson Hyperlegible", size = 3, vjust = -3/2, segment.alpha = 1/8, seed = 231123)+
+  geom_hline(mapping = aes(yintercept = VoPI, lty = "EVoPI"), alpha = 1/2)+
+  scale_linetype_manual(values = c(2))+
+  scale_shape_manual(values = c(1))+
+  scale_x_continuous(name = 'Imprecision (standard deviation) in measurement of yield strength')+
+  scale_y_continuous(name = "Expected value of further testing, £")+
+  ggthemes::theme_base(base_size = 12, base_family = "Atkinson Hyperlegible")+
+  theme(plot.background = element_rect(color = NA),
+        legend.title = element_blank(), legend.position = 'top')
+
+
+```
+
+## Summary
+
+In this notebook, we have considered why sources of variability may arise, and how they can be quantified. We have also shown how this quantification can be used to support consistent and coherent decision making.
+
+We have used a simplified example, and in practice, the decision problem would likely be more complex, and the probabilistic model would be more detailed. However, the principles of this analysis would remain the same.
+
+Please feel free to contact me to discuss any of the topics or ideas I have raised: ddifrancesco@turing.ac.uk
